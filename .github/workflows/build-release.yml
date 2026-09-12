@@ -172,10 +172,96 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-gpu:
+    name: Build GPU ${{ matrix.platform }}
+    needs: metadata
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64-cuda
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            features: cuda
+          - platform: macos-aarch64-metal
+            runner: macos-15
+            target: aarch64-apple-darwin
+            features: metal
+    env:
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      FEATURES: ${{ matrix.features }}
+      BUILD_VERSION: ${{ needs.metadata.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features }}
+
+      - name: Show toolchain
+        run: rustc -vV
+
+      - name: Lint library and CLI with GPU backend
+        run: cargo clippy --lib --bins --target ${{ matrix.target }} --features ${{ matrix.features }} -- -D warnings
+
+      - name: Build GPU release executable
+        run: cargo build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+
+      - name: Package Linux and macOS archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="mtsc-$BUILD_VERSION-$PLATFORM"
+          mkdir -p "dist/$package"
+          cp "target/$TARGET/release/mtsc" README.md LICENSE keys.example.toml "dist/$package/"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+          cd dist
+          shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "mtsc-$env:BUILD_VERSION-$env:PLATFORM"
+          $stage = Join-Path "dist" $package
+          $archive = Join-Path "dist" "$package.zip"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$env:TARGET/release/mtsc.exe" $stage
+          Copy-Item "README.md", "LICENSE", "keys.example.toml" $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -Encoding ascii "$archive.sha256"
+
+      - name: Upload platform artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtsc-${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: Publish GitHub release
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [format, build]
+    needs: [format, build, build-gpu]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

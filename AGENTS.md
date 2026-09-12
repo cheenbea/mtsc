@@ -119,6 +119,7 @@ disclosure restriction from the user (currently: the 99 real-hardware CCR1009 li
 - GPU backends are opt-in cargo features, compile kernels at runtime (no GPU SDK at build time), must pass the startup self-check against scalar digests, and every GPU hit is re-hashed on the CPU scalar path before being reported
 - GPU kernels mirror the CPU search's exact semantics: u64-wrapping candidate index, same base-N counting and padding transforms, and identical fixed/sweep match formulas (`src/gpu/kernel_source.rs` documents the mirroring)
 - CI builds all six Linux/Windows/macOS × x86_64/aarch64 targets, runs Clippy and formatting checks, and packages artifacts; do not use `target-cpu=native` for distributed binaries; GPU features stay OFF in CI builds (kernels JIT at runtime anyway)
+- Never use the `gh` CLI or the GitHub API directly; releases (including test/prerelease versions) are published exclusively by pushing a `v<version>` tag whose name (minus `v`) matches `Cargo.toml`'s `package.version` — CI builds and creates the release
 - Consistent naming: `sid_lo`/`sid_hi` (not hash_lo/d4), `max_collisions` (not target_count)
 - All public functions must have `///` doc comments
 - SHA-256 implementations must annotate the reason for byte-order conversions
