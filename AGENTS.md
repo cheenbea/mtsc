@@ -25,7 +25,12 @@ src/
 ├── targets.rs           Load collision targets and derive MBR mixes
 ├── mbr_table.rs         Validate identity/marker lookup table overrides
 ├── convert.rs           signature_hex ↔ Key text conversion (MTBase64) + metadata decode
-└── curve25519.rs        EC-KCDSA local license verification (curve25519-dalek-based, §8.32)
+├── curve25519.rs        EC-KCDSA local license verification (curve25519-dalek-based, §8.32)
+└── gpu/                 Optional GPU collision-search backends (cargo feature-gated)
+    ├── mod.rs           Shared types, params packing, bitmap prefilter, self-check, rate sampling
+    ├── kernel_source.rs One C core rendered as CUDA C or MSL (per-run constants baked as literals)
+    ├── cuda.rs          NVIDIA backend (cudarc + runtime NVRTC compile; feature "cuda")
+    └── metal.rs         Apple backend (objc2-metal + runtime shader compile; feature "metal", macOS only)
 
 keys.toml                External key configuration (loaded at runtime, no recompile needed)
 mbr-table.toml           Embedded complete MBR lookup table; optional validated runtime overrides
@@ -35,10 +40,10 @@ mbr-table.toml           Embedded complete MBR lookup table; optional validated 
 
 ```bash
 # Search for collisions
-mtsc search --disk-size <N> --unit <g|m|k|b> --threads <threads> [--count <count>] [--from <from_M>] [--model <model>] [--keys <keys.toml>] [--identity <identity_hex>] [--bus <ide|nvme|scsi>] [--pad <start|end>] [--alphabet <symbols>] [--mbr-table <path>]
+mtsc search --disk-size <N> --unit <g|m|k|b> --threads <threads> [--count <count>] [--from <from_M>] [--model <model>] [--keys <keys.toml>] [--identity <identity_hex>] [--bus <ide|nvme|scsi>] [--pad <start|end>] [--alphabet <symbols>] [--mbr-table <path>] [--device <auto|cpu|gpu>]
   --disk-size  Disk size magnitude, paired with --unit; optional for scsi only if --model is supplied
   --unit       Unit: g (gigabytes, default), m (megabytes), k (kilobytes), b (bytes) -- min size is 64M in any unit
-  --threads    Thread count
+  --threads    Thread count (CPU pool only; ignored in GPU mode)
   --count      Collision count (default 1, 0 = unlimited collection)
   --from       Resume from N million hashes (matches the M value in progress output)
   --model      Custom Model (default ROS<N><unit>, e.g. ROS100G, ROS128M)
@@ -48,6 +53,7 @@ mtsc search --disk-size <N> --unit <g|m|k|b> --threads <threads> [--count <count
   --pad        start: left-pad with alphabet[0]; end (default): right-pad natural serial with spaces
   --alphabet   Ordered unique ASCII alphanumeric symbols (at least 2); default 0123456789
   --mbr-table  Validated runtime overrides for the embedded complete identity/marker lookup table
+  --device     Hash device: auto (default; races GPU fleet vs CPU throughput and picks the measured winner), cpu, or gpu (error if no usable device)
 
 # Verify a serial
 mtsc check --serial <value> --disk-size <N> --unit <g|m|k|b> [--model <model>] [--keys <keys.toml>] [--identity <identity_hex>] [--bus <ide|nvme|scsi>] [--license <license.key>]
@@ -70,9 +76,12 @@ mtsc completions <shell>
 
 ```bash
 cargo build --release   # Portable; CPU-specific kernels selected once at startup
+cargo build --release --features cuda    # NVIDIA GPU backend (runtime NVRTC; toolkit not needed to build)
+cargo build --release --features metal   # Apple GPU backend (macOS only)
 RUSTFLAGS='-C target-cpu=native' cargo build --release   # Optional machine-local build
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features cuda -- -D warnings   # With a GPU backend enabled
 cargo fmt --check   # format check
 ```
 
@@ -107,7 +116,9 @@ disclosure restriction from the user (currently: the 99 real-hardware CCR1009 li
 - Do not embed test modules in `src/`, scatter test files elsewhere, or add local test targets to the production Cargo manifest or CI
 - Never force-add files from `/tests/`; before committing, check staged paths for test files and artifacts
 - Preserve production runtime verification: `mtsc verify`, `HashEngine::self_check`, and full SOFTWARE ID verification of search hits
-- CI builds all six Linux/Windows/macOS × x86_64/aarch64 targets, runs Clippy and formatting checks, and packages artifacts; do not use `target-cpu=native` for distributed binaries
+- GPU backends are opt-in cargo features, compile kernels at runtime (no GPU SDK at build time), must pass the startup self-check against scalar digests, and every GPU hit is re-hashed on the CPU scalar path before being reported
+- GPU kernels mirror the CPU search's exact semantics: u64-wrapping candidate index, same base-N counting and padding transforms, and identical fixed/sweep match formulas (`src/gpu/kernel_source.rs` documents the mirroring)
+- CI builds all six Linux/Windows/macOS × x86_64/aarch64 targets, runs Clippy and formatting checks, and packages artifacts; do not use `target-cpu=native` for distributed binaries; GPU features stay OFF in CI builds (kernels JIT at runtime anyway)
 - Consistent naming: `sid_lo`/`sid_hi` (not hash_lo/d4), `max_collisions` (not target_count)
 - All public functions must have `///` doc comments
 - SHA-256 implementations must annotate the reason for byte-order conversions
@@ -137,10 +148,20 @@ Base-35 table: "TN0BYX18S5HZ4IA67DGF3LPCJQRUK9MW2VE"
 - BCD incremental counter + W[5..9] precomputation
 - Full-width sid_hi lookup pre-filter (512 entries, including the required bit 8); sweep matching bypasses fixed-identity prefilter
 
+## GPU Acceleration
+
+- One C core (`kernel_source.rs`) renders as CUDA C (NVRTC, arch from `compute_capability`) or MSL (`newLibraryWithSource`); per-run constants (alphabet, base, padding, match mode, W[5..9], IV, K) are baked as source literals
+- Whole pipeline on-device: index → serial → padding → MikroTik SHA-256 → target compare → hit record; only hit records cross the bus
+- Each thread owns `RUN`=16 consecutive candidates: u64 division once, digit-carry increments after (64-bit division measured 46% of M4 runtime before this split)
+- `--device auto` races measured GPU fleet rate vs CPU engine rate (`HashEngine::sample_rate_hz`) — the winner genuinely flips by machine (RTX 3060 ≈ 2 GH/s vs 137 MH/s CPU; M4 CPU 474 MH/s beats its 200 MH/s GPU)
+- Fixed-mode bitmap keyed by `(sid_hi|0x100)` (bits 256..511); sweep-mode bitmap keyed by raw `sid_hi` holding the exact necessary condition `tv_hi ∈ [256,512) && ((sid_hi^tv_hi)&0xFF) < 32` (i.e. `mix_hi < 32`)
+
 ## Dependencies
 
 - `clap` 4.x — CLI framework (derive mode)
 - `clap_complete` 4.x — shell completion script generation (`completions` subcommand)
+- `cudarc` 0.19 (optional, feature `cuda`) — CUDA driver + NVRTC runtime loading; no GPU SDK needed at build time
+- `objc2-metal`/`objc2-foundation`/`objc2` 0.x (optional, feature `metal`, macOS) — maintained Metal bindings (the older `metal` crate is deprecated)
 - `serde` 1.x and `toml` 1.x — structured key configuration and MBR table parsing
 - `curve25519-dalek` 4.x — audited Curve25519 field/point arithmetic for EC-KCDSA local license
   verification (`LICENSE-VALID` output); see `docs/investigation/license-internals.md` §8.32 for why this one

@@ -5,12 +5,17 @@
 
 mod convert;
 mod curve25519;
+// Shared GPU plumbing stays compiled even without backend features (backends are
+// cfg-gated); uninstantiated pieces (e.g. Flavor::Metal off macOS) are allowed-dead,
+// mirroring `sha256_constants`'s pattern.
+#[allow(dead_code)]
+mod gpu;
 mod mbr_table;
 // The binary's license verifier uses K; the shared library additionally uses the IV.
 #[allow(dead_code)]
 mod sha256_constants;
 use mtsc::sha256;
-use mtsc::sha256_backend::{HashBatch, HashEngine};
+use mtsc::sha256_backend::{precompute_constant_words, HashBatch, HashEngine};
 mod software_id;
 mod targets;
 
@@ -112,6 +117,18 @@ enum Commands {
         /// Example: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" for base 36.
         #[arg(long = "alphabet", default_value = "0123456789")]
         alphabet: String,
+        /// Hash device for the collision search: auto (default) uses a GPU whose kernel
+        /// compiles and passes the startup self-check, falling back to the CPU thread
+        /// pool otherwise; gpu requires a usable GPU; cpu skips GPU probing entirely.
+        /// GPU support is opt-in at build time: `--features cuda` (NVIDIA, Windows/Linux)
+        /// and/or `--features metal` (Apple).
+        #[arg(
+            long = "device",
+            value_enum,
+            ignore_case = true,
+            default_value = "auto"
+        )]
+        device: DeviceChoice,
     },
     /// Convert signature_hex to Key text
     Sig2key {
@@ -221,6 +238,20 @@ enum PadPosition {
     /// Pad at the end with spaces (right-pad), using the candidate's natural digit count.
     /// Default -- see this enum's doc comment for why.
     End,
+}
+
+/// Where the collision search hashes: the CPU thread pool or a GPU (CUDA on NVIDIA,
+/// Metal on Apple). GPU kernels implement the whole per-candidate pipeline on-device
+/// and every reported hit is re-verified by the CPU scalar path.
+#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum DeviceChoice {
+    /// GPU when a compiled-in backend finds a device that passes the startup
+    /// self-check; CPU thread pool otherwise. Default.
+    Auto,
+    /// CPU thread pool only, no GPU probing.
+    Cpu,
+    /// GPU only; exit with an error when no usable device exists.
+    Gpu,
 }
 
 /// Disk size unit, paired with the `--disk-size` magnitude
@@ -677,9 +708,10 @@ fn main() {
             mbr_table,
             pad,
             alphabet,
+            device,
         } => cmd_search(
             disk_size, unit, threads, model, keys, count, from, identity, bus, mbr_table, pad,
-            alphabet,
+            alphabet, device,
         ),
         Commands::Sig2key { signature_hex } => cmd_sig2key(&signature_hex),
         Commands::Key2sig { key_file_or_text } => cmd_key2sig(&key_file_or_text),
@@ -719,6 +751,7 @@ fn cmd_search(
     mbr_table_path: Option<String>,
     pad: PadPosition,
     alphabet: String,
+    device: DeviceChoice,
 ) {
     let (total_bytes, size_label) = resolve_disk_size(disk_size, unit, bus);
     let sector_val = sector_val_for_bus(bus, total_bytes);
@@ -738,11 +771,6 @@ fn cmd_search(
         eprintln!("Error: {error}");
         std::process::exit(1);
     });
-    // One process-wide selection, shared by fixed/sweep and every alphabet/padding mode.
-    let engine = HashEngine::auto_for_threads(num_threads).unwrap_or_else(|error| {
-        eprintln!("FATAL: {error}");
-        std::process::exit(1);
-    });
     println!("Alphabet: '{}' (base {})", alphabet, alphabet_bytes.len());
     if let Some(limit) = candidate_limit {
         println!("Candidate space: {limit} serials; stops at exhaustion (no repeats)");
@@ -759,19 +787,6 @@ fn cmd_search(
     let ctx = if sweep_mode {
         let raw_targets = targets::load_raw_targets(keys.as_deref());
         let table = mbr_table::MbrTable::load(mbr_table_path.as_deref());
-
-        print_sweep_search_banner(
-            &size_label,
-            &model,
-            sector_val,
-            num_threads,
-            &raw_targets,
-            count,
-            start_serial,
-            engine,
-            bus,
-            pad,
-        );
 
         Arc::new(SearchContext {
             model_bytes: build_model_bytes(&model),
@@ -793,20 +808,6 @@ fn cmd_search(
         let (mix_lo, mix_hi) = resolve_mix(identity.as_deref());
         let fixed_targets = targets::load_targets(keys.as_deref(), (mix_lo, mix_hi));
 
-        print_search_banner(
-            &size_label,
-            &model,
-            sector_val,
-            num_threads,
-            &fixed_targets,
-            count,
-            start_serial,
-            engine,
-            identity.as_deref(),
-            bus,
-            pad,
-        );
-
         Arc::new(SearchContext {
             model_bytes: build_model_bytes(&model),
             sv_bytes: sector_val.to_le_bytes(),
@@ -825,14 +826,88 @@ fn cmd_search(
         })
     };
 
-    let handles: Vec<_> = (0..num_threads)
-        .map(|tid| {
-            let ctx = Arc::clone(&ctx);
-            thread::spawn(move || {
-                search_batch(tid, num_threads, start_serial, &ctx, engine);
+    // Device selection happens after the targets exist: the GPU spec bakes the run's
+    // alphabet/padding/match mode and needs the target count for its capacity.
+    let gpu_devices = select_gpu_devices(&ctx, device, num_threads);
+    let engine_desc = if gpu_devices.is_empty() {
+        // One process-wide CPU selection, shared by fixed/sweep and every alphabet/padding mode.
+        let engine = HashEngine::auto_for_threads(num_threads).unwrap_or_else(|error| {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
+        });
+        engine.to_string()
+    } else {
+        gpu_devices
+            .iter()
+            .map(|dev| dev.name())
+            .collect::<Vec<_>>()
+            .join(" + ")
+    };
+
+    if sweep_mode {
+        print_sweep_search_banner(
+            &size_label,
+            &model,
+            sector_val,
+            num_threads,
+            ctx.raw_targets
+                .as_deref()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            count,
+            start_serial,
+            &engine_desc,
+            gpu_devices.len(),
+            bus,
+            pad,
+        );
+    } else {
+        print_search_banner(
+            &size_label,
+            &model,
+            sector_val,
+            num_threads,
+            &ctx.targets,
+            count,
+            start_serial,
+            &engine_desc,
+            gpu_devices.len(),
+            identity.as_deref(),
+            bus,
+            pad,
+        );
+    }
+
+    let handles: Vec<_> = if gpu_devices.is_empty() {
+        // Plain CPU thread pool; each thread strides the candidate space by its batch.
+        let engine = HashEngine::auto_for_threads(num_threads).unwrap_or_else(|error| {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
+        });
+        (0..num_threads)
+            .map(|tid| {
+                let ctx = Arc::clone(&ctx);
+                thread::spawn(move || {
+                    search_batch(tid, num_threads, start_serial, &ctx, engine);
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        // One host thread per GPU device drives huge on-device chunks; the CPU just
+        // verifies and reports hits. HashEngine::auto_for_threads memoizes, so the
+        // CPU description above costs nothing extra here.
+        let device_count = gpu_devices.len();
+        gpu_devices
+            .into_iter()
+            .enumerate()
+            .map(|(did, dev)| {
+                let ctx = Arc::clone(&ctx);
+                thread::spawn(move || {
+                    search_gpu(did, device_count, start_serial, &ctx, dev);
+                })
+            })
+            .collect()
+    };
 
     let mut worker_failed = false;
     for h in handles {
@@ -866,7 +941,8 @@ fn print_search_banner(
     targets: &[targets::Target],
     count: usize,
     start_serial: u64,
-    engine: HashEngine,
+    engine_desc: &str,
+    gpu_devices: usize,
     identity: Option<&str>,
     bus: BusType,
     pad: PadPosition,
@@ -912,13 +988,24 @@ fn print_search_banner(
             println!("Serial pad: end (right-pad with spaces, natural digit count, default)")
         }
     }
-    println!(
-        "Threads: {}  Targets: {}  Mode: {}  Engine: {}",
-        num_threads,
-        targets.len(),
-        mode_str,
-        engine
-    );
+    if gpu_devices > 0 {
+        println!(
+            "Devices: {}  Targets: {}  Mode: {}  Engine: {}",
+            gpu_devices,
+            targets.len(),
+            mode_str,
+            engine_desc
+        );
+        println!("Threads: GPU mode (one host thread per device; --threads ignored)");
+    } else {
+        println!(
+            "Threads: {}  Targets: {}  Mode: {}  Engine: {}",
+            num_threads,
+            targets.len(),
+            mode_str,
+            engine_desc
+        );
+    }
     if start_serial > 0 {
         println!(
             "Start: {}M (serial {})",
@@ -947,7 +1034,8 @@ fn print_sweep_search_banner(
     targets: &[targets::RawTarget],
     count: usize,
     start_serial: u64,
-    engine: HashEngine,
+    engine_desc: &str,
+    gpu_devices: usize,
     bus: BusType,
     pad: PadPosition,
 ) {
@@ -980,13 +1068,24 @@ fn print_sweep_search_banner(
             println!("Serial pad: end (right-pad with spaces, natural digit count, default)")
         }
     }
-    println!(
-        "Threads: {}  Targets: {}  Mode: {}  Engine: {}",
-        num_threads,
-        targets.len(),
-        mode_str,
-        engine
-    );
+    if gpu_devices > 0 {
+        println!(
+            "Devices: {}  Targets: {}  Mode: {}  Engine: {}",
+            gpu_devices,
+            targets.len(),
+            mode_str,
+            engine_desc
+        );
+        println!("Threads: GPU mode (one host thread per device; --threads ignored)");
+    } else {
+        println!(
+            "Threads: {}  Targets: {}  Mode: {}  Engine: {}",
+            num_threads,
+            targets.len(),
+            mode_str,
+            engine_desc
+        );
+    }
     if start_serial > 0 {
         println!(
             "Start: {}M (serial {})",
@@ -1088,6 +1187,274 @@ fn search_batch(
             ctx.write_candidate(&mut base_serial, base);
         }
         if tid == 0 && (base / PROGRESS_INTERVAL) != (previous_base / PROGRESS_INTERVAL) {
+            report_progress(base, &ctx.start, &ctx.found_count);
+        }
+    }
+}
+
+// ---- GPU search ----
+
+/// Candidate indices per GPU kernel launch. Large enough to amortize launch and
+/// readback overhead, small enough for responsive stop/progress checks on any
+/// current GPU (16M candidates at ≥64M hashes/s → ≤250ms per chunk).
+const GPU_CHUNK: u64 = 1 << 24;
+
+/// Chunk size for the auto-mode throughput race (a few launches, ≥200ms).
+const GPU_SAMPLE_CHUNK: u64 = 1 << 25;
+
+/// Build the kernel spec describing this run's serial construction and match mode.
+fn gpu_kernel_spec(ctx: &SearchContext) -> gpu::GpuKernelSpec {
+    let capacity = ctx
+        .raw_targets
+        .as_ref()
+        .map_or(ctx.targets.len(), |raw| raw.len())
+        .max(gpu_probe_indices().len());
+    gpu::GpuKernelSpec {
+        alphabet: ctx.alphabet.clone(),
+        pad_end: matches!(ctx.pad, PadPosition::End),
+        sweep: ctx.raw_targets.is_some(),
+        w5_9: precompute_constant_words(&ctx.model_bytes, &ctx.sv_bytes),
+        capacity,
+    }
+}
+
+/// Probe indices for the GPU startup self-check: small values, a mid-range value, and
+/// the two largest u64 indices. The second self-check run additionally wraps past
+/// u64::MAX back to index 0, so 0 must NOT be a probe (it would hit its target twice
+/// and fail the exact-set comparison).
+fn gpu_probe_indices() -> [u64; 6] {
+    [1, 2, 17, 999, u64::MAX - 1, u64::MAX]
+}
+
+/// Build the GPU self-check contract from scalar reference hashes: one target per
+/// probe index (constructed in the run's own match mode), two runs covering the
+/// probes — a dense block from zero and a small block at the top of the u64 range.
+fn gpu_self_check_plan(ctx: &SearchContext) -> gpu::GpuSelfCheck {
+    let sweep = ctx.raw_targets.is_some();
+    let probe_mbr_vals = [0u16, 1, 2, 0x0BD, 0x123, 0x7FF];
+    let mut targets = Vec::with_capacity(gpu_probe_indices().len());
+    let mut expect = Vec::with_capacity(gpu_probe_indices().len());
+    for (k, &index) in gpu_probe_indices().iter().enumerate() {
+        let mut serial = [ctx.alphabet[0]; SERIAL_LEN];
+        ctx.write_candidate(&mut serial, index);
+        let serial = ctx.pad_candidate(&serial);
+        let (sid_lo, sid_hi) =
+            sha256::hash_40(&build_input_buf(&serial, &ctx.model_bytes, &ctx.sv_bytes));
+        let (lo, hi) = if sweep {
+            // Sweep probes: pick a feasible mbr_val and derive the raw target value
+            // that exactly this candidate's digest can encode to.
+            let mix = (probe_mbr_vals[k] as u64) * targets::MIX_MULTIPLIER;
+            (
+                sid_lo ^ mix as u32,
+                ((sid_hi as u32) | 0x100) ^ (mix >> 32) as u32,
+            )
+        } else {
+            // Fixed probes: need_hi is compared against (sid_hi | 0x100), full width.
+            (sid_lo, (sid_hi as u32) | 0x100)
+        };
+        targets.push((lo, hi));
+        expect.push(gpu::GpuHit {
+            index,
+            sid_lo,
+            sid_hi,
+            target_idx: k as u32,
+        });
+    }
+    gpu::GpuSelfCheck {
+        // Second run crosses u64::MAX, exercising the kernel's wrapping index add.
+        runs: vec![(0, 1024), (u64::MAX - 1, 3)],
+        targets,
+        expect,
+    }
+}
+
+/// The run's target list in GPU match form: fixed `(need_lo, need_hi)` pairs, or the
+/// sweep's raw `(tv_lo, tv_hi)` values.
+fn gpu_run_targets(ctx: &SearchContext) -> Vec<(u32, u32)> {
+    if let Some(raw) = ctx.raw_targets.as_ref() {
+        raw.iter().map(|t| (t.tv_lo, t.tv_hi)).collect()
+    } else {
+        ctx.targets.iter().map(|t| (t.need_lo, t.need_hi)).collect()
+    }
+}
+
+/// Trust-but-verify GPU hits against the scalar path, then report them through the
+/// exact same verification and reporting code as CPU hits.
+fn handle_gpu_hits(ctx: &SearchContext, hits: &[gpu::GpuHit]) {
+    for hit in hits {
+        // Recompute the digest from the candidate index on the scalar path;
+        // disagreement means a device error, not a collision.
+        let mut serial = [ctx.alphabet[0]; SERIAL_LEN];
+        ctx.write_candidate(&mut serial, hit.index);
+        let serial = ctx.pad_candidate(&serial);
+        let actual = sha256::hash_40(&build_input_buf(&serial, &ctx.model_bytes, &ctx.sv_bytes));
+        if actual != (hit.sid_lo, hit.sid_hi) {
+            eprintln!(
+                "Warning: dropped GPU hit at index {}: device digest disagrees with scalar reference",
+                hit.index
+            );
+            continue;
+        }
+        if ctx.raw_targets.is_some() {
+            sweep_check_match(hit.index, hit.sid_lo, hit.sid_hi, ctx);
+        } else {
+            check_match(hit.index, hit.sid_lo, hit.sid_hi, ctx);
+        }
+    }
+}
+
+/// Compile, self-check, and return the GPU devices to search with, honoring the
+/// `--device` choice. `gpu` is a hard error when nothing usable remains. `auto`
+/// races the GPU fleet's measured throughput against the CPU engine's and keeps the
+/// GPUs only when their combined rate wins — measured, because the answer genuinely
+/// flips by machine (NVIDIA dGPU ≫ any CPU; an M4's ARM-SHA2 CPU beats its own GPU).
+fn select_gpu_devices(
+    ctx: &SearchContext,
+    choice: DeviceChoice,
+    num_threads: usize,
+) -> Vec<Box<dyn gpu::GpuDevice>> {
+    if choice == DeviceChoice::Cpu {
+        return Vec::new();
+    }
+    if !gpu::backend_compiled_in() {
+        if choice == DeviceChoice::Gpu {
+            eprintln!(
+                "Error: --device gpu requested but no GPU backend is compiled in; \
+                 rebuild with --features cuda (NVIDIA) and/or --features metal (Apple)"
+            );
+            std::process::exit(1);
+        }
+        return Vec::new();
+    }
+    let plan = gpu_self_check_plan(ctx);
+    let mut checked = Vec::new();
+    for mut device in gpu::compile_devices(&gpu_kernel_spec(ctx)) {
+        match gpu::self_check(device.as_mut(), &plan) {
+            Ok(()) => checked.push(device),
+            Err(error) => {
+                if choice == DeviceChoice::Gpu {
+                    eprintln!("FATAL: {}: {error}", device.name());
+                    std::process::exit(1);
+                }
+                eprintln!(
+                    "Warning: {} failed its startup self-check, falling back: {error}",
+                    device.name()
+                );
+            }
+        }
+    }
+    if checked.is_empty() {
+        if choice == DeviceChoice::Gpu {
+            eprintln!("Error: no usable GPU device found (--device gpu); see warnings above");
+            std::process::exit(1);
+        }
+        return Vec::new();
+    }
+    if choice == DeviceChoice::Gpu {
+        return checked;
+    }
+
+    // Auto: race combined GPU throughput against the CPU engine's measured rate.
+    let limit = candidate_space_limit(ctx.alphabet.len());
+    let probe = gpu::GpuRun {
+        base: 0,
+        n: GPU_SAMPLE_CHUNK.min(limit.unwrap_or(GPU_SAMPLE_CHUNK)),
+        targets: gpu_run_targets(ctx),
+    };
+    let mut rates = Vec::new();
+    for device in checked.iter_mut() {
+        let (rate, hits) = gpu::sample_rate(device.as_mut(), &probe);
+        handle_gpu_hits(ctx, &hits);
+        if rate <= 0.0 {
+            eprintln!(
+                "Warning: {} failed during throughput sampling, excluding it",
+                device.name()
+            );
+        }
+        rates.push(rate);
+    }
+    let fleet_rate: f64 = rates.iter().sum();
+    let mut rate_iter = rates.into_iter();
+    checked.retain(|_| rate_iter.next().is_some_and(|rate| rate > 0.0));
+    if checked.is_empty() {
+        eprintln!("Note: no GPU device survived sampling -- using the CPU pool");
+        return Vec::new();
+    }
+    let cpu_engine = HashEngine::auto_for_threads(num_threads).unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1);
+    });
+    let cpu_rate = cpu_engine
+        .sample_rate_hz(num_threads)
+        .unwrap_or_else(|error| {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
+        });
+    if fleet_rate <= cpu_rate {
+        eprintln!(
+            "Note: CPU wins the measured race ({:.0} vs {:.0} MH/s GPU) -- use --device gpu to force GPU",
+            cpu_rate / 1e6,
+            fleet_rate / 1e6
+        );
+        return Vec::new();
+    }
+    checked
+}
+
+/// Drive one GPU device through the candidate space in `GPU_CHUNK` blocks, strided
+/// across devices the same way CPU threads stride their batches. Hits are re-hashed
+/// on the CPU scalar path before reporting, then flow through the exact same
+/// verification and reporting code as CPU hits.
+fn search_gpu(
+    did: usize,
+    device_count: usize,
+    start_serial: u64,
+    ctx: &SearchContext,
+    mut device: Box<dyn gpu::GpuDevice>,
+) {
+    let chunk = GPU_CHUNK;
+    let step = (device_count as u64) * chunk;
+    let offset = (did as u64) * chunk;
+    let limit = candidate_space_limit(ctx.alphabet.len());
+    let mut base = if let Some(limit) = limit {
+        match start_serial.checked_add(offset) {
+            Some(base) if base < limit => base,
+            _ => return,
+        }
+    } else {
+        start_serial.wrapping_add(offset)
+    };
+    let targets = gpu_run_targets(ctx);
+
+    loop {
+        if ctx.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // The final block before a finite candidate limit can be short; the kernel
+        // hashes whatever n says, no padding lanes involved.
+        let active = limit.map_or(chunk, |limit| chunk.min(limit - base));
+        let hits = device
+            .run(&gpu::GpuRun {
+                base,
+                n: active,
+                targets: targets.clone(),
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("FATAL: {}: {error}", device.name());
+                std::process::exit(1);
+            });
+        handle_gpu_hits(ctx, &hits);
+
+        let previous_base = base;
+        if let Some(limit) = limit {
+            match base.checked_add(step) {
+                Some(next) if next < limit => base = next,
+                _ => return,
+            }
+        } else {
+            base = base.wrapping_add(step);
+        }
+        if did == 0 && (base / PROGRESS_INTERVAL) != (previous_base / PROGRESS_INTERVAL) {
             report_progress(base, &ctx.start, &ctx.found_count);
         }
     }

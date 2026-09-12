@@ -17,12 +17,25 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+default = []
+# GPU collision-search backends. CUDA builds anywhere (the CUDA toolkit is only
+# needed at runtime, via NVRTC dynamic loading); Metal only links on macOS.
+cuda = ["dep:cudarc", "cudarc/cuda-version-from-build-system", "cudarc/fallback-latest"]
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+cudarc = { version = "0.19", optional = true }
 curve25519-dalek = "4"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSError"] }
+objc2-metal = { version = "0.3", optional = true }
 
 [profile.release]
 opt-level = 3

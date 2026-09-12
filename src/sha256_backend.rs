@@ -176,6 +176,13 @@ impl HashEngine {
         self.batch_size
     }
 
+    /// Measure this engine's combined rate over `threads` workers (hashes/second),
+    /// reusing the calibration harness. Used by the search's device auto-selection
+    /// to race CPU against GPU throughput on the actual machine.
+    pub fn sample_rate_hz(self, threads: usize) -> Result<f64, &'static str> {
+        sample_rate(self, threads, Duration::from_millis(60))
+    }
+
     /// Compare every lane against scalar using a known vector and varied bytes.
     pub fn self_check(self) -> Result<(), &'static str> {
         for pattern in [0, 1, 0x7f, 0x80, 0xff] {

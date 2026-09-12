@@ -5,6 +5,7 @@
 ## Features
 
 - **CPU-selected SHA-256 backends**: scalar, SHA-NI x1/x2/x4, AVX2 x8, AVX-512 x16, ARM SHA2 x1/x2/x4, and NEON x4. Startup detects support and calibrates once at the requested thread count; no feature detection occurs in the hashing loop.
+- **Optional GPU acceleration** (CUDA on NVIDIA, Metal on Apple): the whole candidate pipeline runs on-device and every hit is re-verified on the CPU; `--device auto` races GPU against CPU throughput and picks the measured winner
 - **Hand-implemented MikroTik crypto primitives**: SHA-256 and MTBase64 have no MikroTik-compatible library equivalent, so both are hand-implemented; standard Curve25519 EC-KCDSA verification uses the audited `curve25519-dalek` crate instead of hand-rolled field/point arithmetic (see `docs/investigation/license-internals.md` §8.32 for why)
 - **External key configuration**: add new signatures via `keys.toml` without recompiling
 - **Flexible search**: configurable serial alphabet and padding, plus a full 2048-value MBR identity search with an embedded lookup table
@@ -16,6 +17,10 @@
 ```bash
 # Portable build: individual kernels enable only their required CPU features
 cargo build --release
+
+# Optional GPU backends (kernels compile at runtime; no GPU SDK needed to build)
+cargo build --release --features cuda    # NVIDIA, Windows/Linux
+cargo build --release --features metal   # Apple GPUs, macOS
 
 # Optional machine-local build; do not distribute it to older CPUs
 RUSTFLAGS='-C target-cpu=native' cargo build --release
@@ -55,6 +60,13 @@ mtsc search -s 42 -t 8 -f 50000
 
 # Specify keys.toml
 mtsc search -s 100 -t 16 -k /path/to/keys.toml
+
+# Hash on a GPU instead of the CPU pool (requires a --features cuda/metal build).
+# auto (default) races GPU vs CPU throughput and picks the measured winner -- an
+# NVIDIA card wins by an order of magnitude; Apple Silicon's ARM-SHA2 CPU usually
+# beats its own GPU, and auto picks the CPU there.
+mtsc search --disk-size 100 --threads 1 --device gpu
+mtsc search --disk-size 100 --device cpu
 ```
 
 By default, search right-pads the natural serial with spaces (`--pad end`) and searches all 2048 MBR values. Use the reported serial **together with its identity and marker**; an identity from another result will not reproduce the same SOFTWARE ID.

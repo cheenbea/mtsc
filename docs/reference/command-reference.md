@@ -27,6 +27,7 @@ mtsc search --disk-size 128 --unit m --threads 16 --count 0 --keys keys.toml
 | `--pad <start\|end>` | Default `end`: use the candidate's natural symbol length and **right-pad with spaces** to 20 bytes (`123` becomes `123` plus 17 spaces). `start` left-pads to 20 bytes with `alphabet[0]` (`0` for the default alphabet). |
 | `--alphabet <symbols>` | Ordered candidate alphabet; default `0123456789`. Must contain at least two distinct, non-repeated ASCII letters/digits. Order defines base-N counting and the first symbol is the zero/left-padding symbol. For example, `0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ` selects base 36. |
 | `--bus <ide\|scsi\|nvme>` | `ide` (default) covers `ide0` and `sata0`/AHCI. `nvme` uses the same size-dependent sector rounding as `ide`. `scsi` covers `scsi0`/`virtio-scsi-pci`, **not `sata0`**, and forces `sector_val=0`. SCSI activation is confirmed on x86_64; ARM64 virtualization-detection caveats remain in [license-internals.md §8](../investigation/license-internals.md#8-arm32-keyman-on-virtio-scsi-a-platform-specific-investigation). |
+| `--device <auto\|cpu\|gpu>` | Hash device for the search, when the binary was built with `--features cuda` (NVIDIA) and/or `--features metal` (Apple). `auto` (default) self-checks every GPU against scalar digests, then races the GPU fleet's measured throughput against the CPU engine's and picks the winner. `gpu` requires a usable device; `cpu` skips GPU probing. GPU hits are always re-hashed on the CPU before being reported. |
 
 ### Compatibility with older collision tables
 
@@ -43,7 +44,7 @@ Default sweep results include `identity` and `marker`. **Deploy those exact valu
 
 If `alphabet_len^20` fits in `u64`, search stops and reports exhaustion instead of repeating candidates. Otherwise, the `u64` candidate index wraps to zero after `u64::MAX`. An overflowing `--from` offset or one beyond a finite candidate space is rejected.
 
-Candidate generation supports every CPU backend: scalar, SHA-NI, AVX2, AVX-512, ARM SHA2, and NEON as supported by the CPU/OS. Startup calibration selects the backend once for the requested thread count; backend-owned batches are retained for both padding modes and custom alphabets. This does not guarantee identical end-to-end throughput for different alphabets or sweep/fixed-identity modes. See [SHA-256 backends](sha256-backends.md).
+Candidate generation supports every CPU backend: scalar, SHA-NI, AVX2, AVX-512, ARM SHA2, and NEON as supported by the CPU/OS. Startup calibration selects the backend once for the requested thread count; backend-owned batches are retained for both padding modes and custom alphabets. This does not guarantee identical end-to-end throughput for different alphabets or sweep/fixed-identity modes. In GPU mode (`--device gpu`, or `auto` picking a GPU), one host thread per device drives 16M-candidate on-device chunks and `--threads` is ignored. See [SHA-256 backends](sha256-backends.md).
 
 ### Minimum disk size per unit
 
