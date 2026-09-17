@@ -120,8 +120,9 @@ enum Commands {
         /// Hash device for the collision search: auto (default) uses a GPU whose kernel
         /// compiles and passes the startup self-check, falling back to the CPU thread
         /// pool otherwise; gpu requires a usable GPU; cpu skips GPU probing entirely.
-        /// GPU support is opt-in at build time: `--features cuda` (NVIDIA, Windows/Linux)
-        /// and/or `--features metal` (Apple).
+        /// GPU support compiles automatically when the build machine has the toolchain
+        /// (CUDA toolkit, or macOS for Metal); force with `--features cuda`/`--features
+        /// metal`, or build CPU-only with `--no-default-features`.
         #[arg(
             long = "device",
             value_enum,
@@ -1320,7 +1321,8 @@ fn select_gpu_devices(
         if choice == DeviceChoice::Gpu {
             eprintln!(
                 "Error: --device gpu requested but no GPU backend is compiled in; \
-                 rebuild with --features cuda (NVIDIA) and/or --features metal (Apple)"
+                 build on a machine with the CUDA toolkit (NVIDIA) or on macOS (Metal), \
+                 or force with --features cuda / --features metal"
             );
             std::process::exit(1);
         }

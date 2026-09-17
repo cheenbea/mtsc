@@ -15,12 +15,16 @@
 ## Build
 
 ```bash
-# Portable build: individual kernels enable only their required CPU features
+# GPU support is automatic when the local toolchain exists: a CUDA toolkit
+# (nvcc) enables the NVIDIA backend, macOS enables the Metal backend; kernels
+# compile at runtime so no GPU SDK is needed to build. Without a toolchain
+# the build is CPU-only.
 cargo build --release
 
-# Optional GPU backends (kernels compile at runtime; no GPU SDK needed to build)
-cargo build --release --features cuda    # NVIDIA, Windows/Linux
-cargo build --release --features metal   # Apple GPUs, macOS
+# Force a backend explicitly, or build lean CPU-only binaries
+cargo build --release --features cuda    # NVIDIA (Windows/Linux)
+cargo build --release --features metal   # Apple GPUs (macOS)
+cargo build --release --no-default-features
 
 # Optional machine-local build; do not distribute it to older CPUs
 RUSTFLAGS='-C target-cpu=native' cargo build --release
@@ -61,7 +65,8 @@ mtsc search -s 42 -t 8 -f 50000
 # Specify keys.toml
 mtsc search -s 100 -t 16 -k /path/to/keys.toml
 
-# Hash on a GPU instead of the CPU pool (requires a --features cuda/metal build).
+# Hash on a GPU instead of the CPU pool (build on a machine with the CUDA
+# toolkit, or on macOS, and GPU support compiles in automatically).
 # auto (default) races GPU vs CPU throughput and picks the measured winner -- an
 # NVIDIA card wins by an order of magnitude; Apple Silicon's ARM-SHA2 CPU usually
 # beats its own GPU, and auto picks the CPU there.

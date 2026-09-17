@@ -26,11 +26,11 @@ src/
 ├── mbr_table.rs         Validate identity/marker lookup table overrides
 ├── convert.rs           signature_hex ↔ Key text conversion (MTBase64) + metadata decode
 ├── curve25519.rs        EC-KCDSA local license verification (curve25519-dalek-based, §8.32)
-└── gpu/                 Optional GPU collision-search backends (cargo feature-gated)
+└── gpu/                 GPU collision-search backends (toolchain auto-detected at build)
     ├── mod.rs           Shared types, params packing, bitmap prefilter, self-check, rate sampling
     ├── kernel_source.rs One C core rendered as CUDA C or MSL (per-run constants baked as literals)
-    ├── cuda.rs          NVIDIA backend (cudarc + runtime NVRTC compile; feature "cuda")
-    └── metal.rs         Apple backend (objc2-metal + runtime shader compile; feature "metal", macOS only)
+    ├── cuda.rs          NVIDIA backend (cudarc + runtime NVRTC compile; enabled by local toolkit or feature "cuda")
+    └── metal.rs         Apple backend (objc2-metal + runtime shader compile; macOS, default under gpu-auto)
 
 keys.toml                External key configuration (loaded at runtime, no recompile needed)
 mbr-table.toml           Embedded complete MBR lookup table; optional validated runtime overrides
@@ -75,13 +75,14 @@ mtsc completions <shell>
 ## Build
 
 ```bash
-cargo build --release   # Portable; CPU-specific kernels selected once at startup
-cargo build --release --features cuda    # NVIDIA GPU backend (runtime NVRTC; toolkit not needed to build)
-cargo build --release --features metal   # Apple GPU backend (macOS only)
+cargo build --release   # Auto: build.rs compiles the CUDA backend when a local CUDA toolkit (nvcc/CUDA_PATH) exists, the Metal backend on macOS; otherwise CPU-only
+cargo build --release --features cuda    # Force the CUDA backend (NVIDIA)
+cargo build --release --features metal   # Force the Metal backend (Apple, macOS)
+cargo build --release --no-default-features   # Lean CPU-only build (what CI ships)
 RUSTFLAGS='-C target-cpu=native' cargo build --release   # Optional machine-local build
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features cuda -- -D warnings   # With a GPU backend enabled
+cargo clippy --all-targets --features cuda -- -D warnings   # With a GPU backend force-enabled
 cargo fmt --check   # format check
 ```
 
@@ -116,9 +117,9 @@ disclosure restriction from the user (currently: the 99 real-hardware CCR1009 li
 - Do not embed test modules in `src/`, scatter test files elsewhere, or add local test targets to the production Cargo manifest or CI
 - Never force-add files from `/tests/`; before committing, check staged paths for test files and artifacts
 - Preserve production runtime verification: `mtsc verify`, `HashEngine::self_check`, and full SOFTWARE ID verification of search hits
-- GPU backends are opt-in cargo features, compile kernels at runtime (no GPU SDK at build time), must pass the startup self-check against scalar digests, and every GPU hit is re-hashed on the CPU scalar path before being reported
+- GPU backends compile kernels at runtime (no GPU SDK at build time), are auto-enabled by `build.rs` toolchain detection under the default `gpu-auto` feature (CUDA: nvcc/`CUDA_PATH`/`CUDA_HOME`/`CUDA_ROOT` or nvcc on PATH; Metal: any macOS target), must pass the startup self-check against scalar digests, and every GPU hit is re-hashed on the CPU scalar path before being reported; cudarc's lazy library loading panics on mismatch, so its entry points run under `catch_unwind` and degrade to per-device warnings
 - GPU kernels mirror the CPU search's exact semantics: u64-wrapping candidate index, same base-N counting and padding transforms, and identical fixed/sweep match formulas (`src/gpu/kernel_source.rs` documents the mirroring)
-- CI builds all six Linux/Windows/macOS × x86_64/aarch64 targets, runs Clippy and formatting checks, and packages artifacts; do not use `target-cpu=native` for distributed binaries; GPU features stay OFF in CI builds (kernels JIT at runtime anyway)
+- CI builds all six Linux/Windows/macOS × x86_64/aarch64 targets with `--no-default-features` (lean CPU-only binaries; CI runners have no GPU toolchains anyway), runs Clippy and formatting checks, and packages artifacts; do not use `target-cpu=native` for distributed binaries; GPU binaries are local builds only — never add GPU jobs to CI
 - Never use the `gh` CLI or the GitHub API directly; releases (including test/prerelease versions) are published exclusively by pushing a `v<version>` tag whose name (minus `v`) matches `Cargo.toml`'s `package.version` — CI builds and creates the release
 - Consistent naming: `sid_lo`/`sid_hi` (not hash_lo/d4), `max_collisions` (not target_count)
 - All public functions must have `///` doc comments
@@ -161,8 +162,8 @@ Base-35 table: "TN0BYX18S5HZ4IA67DGF3LPCJQRUK9MW2VE"
 
 - `clap` 4.x — CLI framework (derive mode)
 - `clap_complete` 4.x — shell completion script generation (`completions` subcommand)
-- `cudarc` 0.19 (optional, feature `cuda`) — CUDA driver + NVRTC runtime loading; no GPU SDK needed at build time
-- `objc2-metal`/`objc2-foundation`/`objc2` 0.x (optional, feature `metal`, macOS) — maintained Metal bindings (the older `metal` crate is deprecated)
+- `cudarc` 0.19 (optional, features `gpu-auto`/`cuda`) — CUDA driver + NVRTC runtime loading; no GPU SDK needed at build time
+- `objc2-metal`/`objc2-foundation`/`objc2` 0.x (macOS target, non-optional) — maintained Metal bindings (the older `metal` crate is deprecated); the backend module is feature-gated
 - `serde` 1.x and `toml` 1.x — structured key configuration and MBR table parsing
 - `curve25519-dalek` 4.x — audited Curve25519 field/point arithmetic for EC-KCDSA local license
   verification (`LICENSE-VALID` output); see `docs/investigation/license-internals.md` §8.32 for why this one

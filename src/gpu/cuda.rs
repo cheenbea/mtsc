@@ -1,15 +1,19 @@
 //! CUDA backend (NVIDIA GPUs), built on `cudarc` with runtime NVRTC compilation.
 //!
-//! The CUDA toolkit is needed only at runtime: `cudarc` dynamic-loads the driver
-//! (`nvcuda`) and NVRTC libraries, and the kernel is compiled to PTX for the exact
-//! compute capability of each device when the search starts. A machine with a driver
-//! but no toolkit reports the missing library and the search falls back to CPU.
+//! `cudarc` lazy-loads the driver (`nvcuda`) and NVRTC shared libraries and
+//! **panics** when they can't be found — including when the installed toolkit's
+//! NVRTC library name doesn't match the cudarc build's version-specific search
+//! list, or the toolkit's `bin` directory isn't on `PATH`. Every entry point that
+//! can trigger a lazy load therefore runs under `catch_unwind` and surfaces the
+//! failure as a per-device `Err` (warning + CPU fallback) instead of a crash.
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use cudarc::driver::safe::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
-use std::sync::Arc;
 
 use super::kernel_source::{self, Flavor};
 use super::{decode_hits, pack_run_params, GpuDevice, GpuHit, GpuKernelSpec, GpuRun};
@@ -26,15 +30,39 @@ pub(crate) struct CudaGpu {
 }
 
 /// One `Result` per CUDA device present; `Err` carries the device tag and reason.
+/// Panics from cudarc's lazy library loading are caught and reported as errors.
 pub(crate) fn enumerate(spec: &GpuKernelSpec) -> Vec<Result<Box<dyn GpuDevice>, (String, String)>> {
-    let count = match CudaContext::device_count() {
-        Ok(n) if n > 0 => n as usize,
-        Ok(_) => return Vec::new(),
-        Err(e) => return vec![Err(("driver".to_string(), e.to_string()))],
+    let count = match catch_unwind(CudaContext::device_count) {
+        Ok(Ok(n)) if n > 0 => n as usize,
+        Ok(Ok(_)) => return Vec::new(),
+        Ok(Err(e)) => return vec![Err(("driver".to_string(), e.to_string()))],
+        Err(panic) => {
+            return vec![Err((
+                "driver".to_string(),
+                format!("CUDA driver library unavailable: {}", panic_text(panic)),
+            ))]
+        }
     };
     (0..count)
-        .map(|ordinal| build(spec, ordinal).map_err(|e| (format!("cuda[{ordinal}]"), e)))
+        .map(|ordinal| {
+            catch_unwind(AssertUnwindSafe(|| build(spec, ordinal)))
+                .unwrap_or_else(|panic| {
+                    Err(format!("initialization panicked: {}", panic_text(panic)))
+                })
+                .map_err(|e| (format!("cuda[{ordinal}]"), e))
+        })
         .collect()
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = panic.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = panic.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// Initialize device `ordinal` and compile the kernel for it.

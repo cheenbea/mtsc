@@ -18,11 +18,16 @@ test = false
 bench = false
 
 [features]
-default = []
-# GPU collision-search backends. CUDA builds anywhere (the CUDA toolkit is only
-# needed at runtime, via NVRTC dynamic loading); Metal only links on macOS.
+# Default: build.rs probes the local toolchain and compiles the CUDA backend when a
+# CUDA toolkit (nvcc) is found; the Metal backend compiles on macOS targets. Without
+# a toolchain the build is CPU-only. CI passes --no-default-features for lean
+# portable CPU artifacts; GPU binaries are local builds by policy.
+default = ["gpu-auto"]
+gpu-auto = ["dep:cudarc", "cudarc/cuda-version-from-build-system", "cudarc/fallback-latest"]
+# Explicit force switches (override detection; runtime still degrades gracefully
+# when the required libraries are absent).
 cuda = ["dep:cudarc", "cudarc/cuda-version-from-build-system", "cudarc/fallback-latest"]
-metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+metal = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -32,10 +37,12 @@ curve25519-dalek = "4"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 
+# Always present on macOS (the Metal toolchain ships with the OS SDK); the backend
+# module itself is gated by the gpu-auto/metal features in src/gpu/mod.rs.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSError"] }
-objc2-metal = { version = "0.3", optional = true }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-metal = "0.3"
 
 [profile.release]
 opt-level = 3

@@ -8,15 +8,20 @@
 //! trust-but-verify contract.
 //!
 //! Both backends compile the generated kernel source at runtime (NVRTC /
-//! `newLibraryWithSource`), so a plain `cargo build` needs no GPU SDK; enable the
-//! backends with `--features cuda` and/or `--features metal` (Metal only links on
-//! macOS).
+//! `newLibraryWithSource`), so no GPU SDK is needed to build. By default (feature
+//! `gpu-auto`) `build.rs` compiles the CUDA backend when a local CUDA toolkit is
+//! detected and the Metal backend on macOS; `--features cuda`/`--features metal`
+//! force them explicitly, and `--no-default-features` builds CPU-only.
 
 mod kernel_source;
 
-#[cfg(feature = "cuda")]
+// CUDA: forced by feature "cuda", or auto-enabled by the default "gpu-auto" feature
+// when build.rs detected a local CUDA toolkit (cfg gpu_cuda_toolchain).
+#[cfg(any(feature = "cuda", all(feature = "gpu-auto", gpu_cuda_toolchain)))]
 pub(crate) mod cuda;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+// Metal: the toolchain ships with every macOS SDK, so macOS targets compile the
+// backend under gpu-auto (default) or an explicit "metal".
+#[cfg(all(target_os = "macos", any(feature = "metal", feature = "gpu-auto")))]
 pub(crate) mod metal;
 
 /// One collision candidate reported by a GPU kernel. Values are advisory only — the
@@ -188,26 +193,30 @@ pub(crate) fn self_check(dev: &mut dyn GpuDevice, check: &GpuSelfCheck) -> Resul
 /// Compile the kernel for every usable GPU in the system, warning (not failing) about
 /// individual devices that are present but unusable. Returns the ready devices.
 #[cfg_attr(
-    not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))),
+    not(any(
+        feature = "cuda",
+        all(feature = "gpu-auto", gpu_cuda_toolchain),
+        all(target_os = "macos", any(feature = "metal", feature = "gpu-auto")),
+    )),
     allow(unused_mut)
 )]
 pub(crate) fn compile_devices(spec: &GpuKernelSpec) -> Vec<Box<dyn GpuDevice>> {
     let mut devices: Vec<Box<dyn GpuDevice>> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", all(feature = "gpu-auto", gpu_cuda_toolchain)))]
     for result in cuda::enumerate(spec) {
         match result {
             Ok(dev) => devices.push(dev),
             Err((name, error)) => eprintln!("Warning: CUDA device {name} unusable: {error}"),
         }
     }
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(target_os = "macos", any(feature = "metal", feature = "gpu-auto")))]
     for result in metal::enumerate(spec) {
         match result {
             Ok(dev) => devices.push(dev),
             Err((name, error)) => eprintln!("Warning: Metal device {name} unusable: {error}"),
         }
     }
-    let _ = spec; // (unused when no backend feature is enabled)
+    let _ = spec; // (unused when no backend is compiled in)
     devices
 }
 
@@ -242,6 +251,10 @@ pub(crate) fn sample_rate(dev: &mut dyn GpuDevice, run: &GpuRun) -> (f64, Vec<Gp
 pub(crate) fn backend_compiled_in() -> bool {
     cfg!(any(
         feature = "cuda",
-        all(feature = "metal", target_os = "macos")
+        all(feature = "gpu-auto", gpu_cuda_toolchain),
+        all(
+            target_os = "macos",
+            any(feature = "metal", feature = "gpu-auto")
+        ),
     ))
 }
