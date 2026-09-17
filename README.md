@@ -30,10 +30,12 @@ cargo build --release --no-default-features
 RUSTFLAGS='-C target-cpu=native' cargo build --release
 ```
 
-## Downloads
+## Getting the binary
 
-Download available binaries from [GitHub Releases](https://github.com/feewg/ros-serialgen/releases).
-Supports Linux, Windows, and macOS on x86_64 and ARM64.
+Build from source — there are no distributed binaries. `cargo build --release`
+compiles automatically for the local machine: a CUDA toolkit (nvcc) adds the
+NVIDIA GPU backend, macOS adds the Metal backend, and machines without a GPU
+toolchain get the CPU-only build (see [Build](#build)).
 
 ## Usage
 

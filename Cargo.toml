@@ -20,8 +20,8 @@ bench = false
 [features]
 # Default: build.rs probes the local toolchain and compiles the CUDA backend when a
 # CUDA toolkit (nvcc) is found; the Metal backend compiles on macOS targets. Without
-# a toolchain the build is CPU-only. CI passes --no-default-features for lean
-# portable CPU artifacts; GPU binaries are local builds by policy.
+# a toolchain the build is CPU-only. Everyone builds locally from source — there is
+# no cloud/CI build by policy; --no-default-features selects a lean CPU-only build.
 default = ["gpu-auto"]
 gpu-auto = ["dep:cudarc", "cudarc/cuda-version-from-build-system", "cudarc/fallback-latest"]
 # Explicit force switches (override detection; runtime still degrades gracefully

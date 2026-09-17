@@ -78,7 +78,7 @@ mtsc completions <shell>
 cargo build --release   # Auto: build.rs compiles the CUDA backend when a local CUDA toolkit (nvcc/CUDA_PATH) exists, the Metal backend on macOS; otherwise CPU-only
 cargo build --release --features cuda    # Force the CUDA backend (NVIDIA)
 cargo build --release --features metal   # Force the Metal backend (Apple, macOS)
-cargo build --release --no-default-features   # Lean CPU-only build (what CI ships)
+cargo build --release --no-default-features   # Lean CPU-only build
 RUSTFLAGS='-C target-cpu=native' cargo build --release   # Optional machine-local build
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
@@ -114,13 +114,13 @@ disclosure restriction from the user (currently: the 99 real-hardware CCR1009 li
 - Keep generated logs, performance samples, environment dumps, and build artifacts out of Git
 - Keep Git-tracked library/CLI code production-only; do not commit automated tests or standalone benchmark suites
 - Put all future local test scripts, harnesses, fixtures, benchmark programs, logs, and results under the gitignored `/tests/<task>/` directory; keep test-specific build output there too (for Rust harnesses, set `CARGO_TARGET_DIR` accordingly)
-- Do not embed test modules in `src/`, scatter test files elsewhere, or add local test targets to the production Cargo manifest or CI
+- Do not embed test modules in `src/`, scatter test files elsewhere, or add local test targets to the production Cargo manifest
 - Never force-add files from `/tests/`; before committing, check staged paths for test files and artifacts
 - Preserve production runtime verification: `mtsc verify`, `HashEngine::self_check`, and full SOFTWARE ID verification of search hits
 - GPU backends compile kernels at runtime (no GPU SDK at build time), are auto-enabled by `build.rs` toolchain detection under the default `gpu-auto` feature (CUDA: nvcc/`CUDA_PATH`/`CUDA_HOME`/`CUDA_ROOT` or nvcc on PATH; Metal: any macOS target), must pass the startup self-check against scalar digests, and every GPU hit is re-hashed on the CPU scalar path before being reported; cudarc's lazy library loading panics on mismatch, so its entry points run under `catch_unwind` and degrade to per-device warnings
 - GPU kernels mirror the CPU search's exact semantics: u64-wrapping candidate index, same base-N counting and padding transforms, and identical fixed/sweep match formulas (`src/gpu/kernel_source.rs` documents the mirroring)
-- CI builds all six Linux/Windows/macOS × x86_64/aarch64 targets with `--no-default-features` (lean CPU-only binaries; CI runners have no GPU toolchains anyway), runs Clippy and formatting checks, and packages artifacts; do not use `target-cpu=native` for distributed binaries; GPU binaries are local builds only — never add GPU jobs to CI
-- Never use the `gh` CLI or the GitHub API directly; releases (including test/prerelease versions) are published exclusively by pushing a `v<version>` tag whose name (minus `v`) matches `Cargo.toml`'s `package.version` — CI builds and creates the release
+- No GitHub Actions: all binaries are compiled by users from source (`cargo build --release`, GPU backends auto-detected per the rules above) — do not add workflow files or cloud build jobs; do not use `target-cpu=native` in anything intended for others
+- Never use the `gh` CLI or the GitHub API directly; there is no release automation — historical GitHub releases predate this policy and new ones are not created
 - Consistent naming: `sid_lo`/`sid_hi` (not hash_lo/d4), `max_collisions` (not target_count)
 - All public functions must have `///` doc comments
 - SHA-256 implementations must annotate the reason for byte-order conversions

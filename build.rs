@@ -4,8 +4,8 @@
 //! toolkit is present and the Metal backend when targeting macOS; without a
 //! toolchain the build is CPU-only. Force explicitly with `--features cuda`
 //! (NVIDIA) / `--features metal` (Apple), or build lean CPU-only binaries with
-//! `--no-default-features` — which is what CI uses for the portable artifacts,
-//! since GPU binaries are local builds by policy.
+//! `--no-default-features`. Everyone compiles locally from source — there is no
+//! cloud/CI build, so detection always reflects the building machine.
 //!
 //! Detection result reaches the code as the `gpu_cuda_toolchain` cfg (see the
 //! module gates in `src/gpu/mod.rs`); the Metal backend needs no probe because
