@@ -285,9 +285,10 @@ pub fn feasible_mbr_val(required_mix: u64) -> Option<u16> {
 
 #[derive(serde::Deserialize)]
 pub(crate) struct KeyEntry {
+    #[serde(rename = "softwareId")]
     pub(crate) software_id: String,
     // Legacy SID-only entries remain valid collision targets without a license payload.
-    #[serde(default)]
+    #[serde(default, rename = "signature")]
     pub(crate) signature_hex: String,
 }
 

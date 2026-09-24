@@ -104,9 +104,9 @@ separate leak surface. Entries marked `private = true` in `keys.toml` are under 
 disclosure restriction from the user (currently: the 99 real-hardware CCR1009 licenses imported
 2026-09-07, plus `WUB2-EYCK`, `HCC0-4FJR`, `XU4M-NJ40`):
 
-- Never paste their `identity`, `model`, `serial`, or `signature_hex` field values into a chat
+- Never paste their `identity`, `model`, `serial`, or `signature` field values into a chat
   response or tool-call diff (Edit old_string/new_string included) — refer to them only by
-  `software_id`.
+  `softwareId`.
 - Entries **without** `private = true` are not covered by this restriction and may be discussed/
   quoted normally (as has been done throughout this project's docs/investigation notes).
 - When adding a new `[[key]]` entry sourced from the user's own private license inventory (as

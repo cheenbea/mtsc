@@ -24,6 +24,6 @@ writable config gap), but not independently confirmed for this device.
 - HW Options: 2908, HW setting: Has_POE out, Has_WiFi
 - Factory RouterBoot version: 6.46.8
 
-Associated with `software_id = "ESXZ-K7X6"` in `keys.toml` (Version 6, Level 4,
+Associated with `softwareId = "ESXZ-K7X6"` in `keys.toml` (Version 6, Level 4,
 EC-KCDSA-verified valid) -- the license key text for that entry was supplied directly in
 conversation, not independently re-found on the linked forum page.

@@ -1056,8 +1056,8 @@ struct KeysFile {
 
 #[derive(Deserialize)]
 struct KeyEntry {
-    software_id: String,
-    signature_hex: String,
+    softwareId: String,
+    signature: String,
 }
 
 fn load_from_file(path: &str) -> Option<Vec<KeyEntry>> {
@@ -1079,7 +1079,7 @@ fn load_from_file(path: &str) -> Option<Vec<KeyEntry>> {
 exists, must stay hand-written), TOML is a fully standard, open format with mature
 Rust support -- there's no proprietary-format reason to hand-roll this one. Confirmed a
 concrete correctness bug in the current parser: a line like
-`signature_hex = "ABC123..." # a comment` (valid TOML, inline comment after a value) --
+`signature = "ABC123..." # a comment` (valid TOML, inline comment after a value) --
 `trim_matches('"')` only strips a matching quote from *both* ends of the remaining
 string; since the trailing character here is `t` (from "comment"), not `"`, only the
 leading quote gets stripped, leaving `ABC123...” # a comment` as the parsed value --
@@ -1262,7 +1262,7 @@ write once implementation actually lands (adjust wording/version number at that 
 ### Fixed
 - `keys.toml` parsing now uses a real TOML parser (`toml`/`serde`) instead of a
   hand-rolled line scanner -- fixes silent data corruption when a value line has a
-  trailing inline comment (e.g. `signature_hex = "..." # comment`).
+  trailing inline comment (e.g. `signature = "..." # comment`).
 ```
 
 This is a **breaking-change-heavy** release by CLI-tool standards (renamed binary,

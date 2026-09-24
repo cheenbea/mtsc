@@ -14,7 +14,10 @@ chr-license-data.md
 chr-system-id-formula.md
 keys.toml
 keys.toml.zip
-keys-unreachable.toml
+keys.unreachable.toml
+keys.blacklisted.toml
 /backup/
 /logs/
+/sc/
 /tests/
+keys.full.toml

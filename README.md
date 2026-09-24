@@ -127,8 +127,8 @@ Edit `keys.toml` and append an entry; no recompilation needed:
 
 ```toml
 [[key]]
-software_id = "XXXX-XXXX"
-signature_hex = "..."
+softwareId = "XXXX-XXXX"
+signature = "..."
 ```
 
 More keys = faster search (linear speedup).
