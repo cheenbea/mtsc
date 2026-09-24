@@ -253,7 +253,10 @@ const fn mod_inverse_pow2_64(a: u64) -> u64 {
     x
 }
 
-const MIX_MULTIPLIER_INV: u64 = mod_inverse_pow2_64(MIX_MULTIPLIER);
+/// `pub(crate)` (not private) because the GPU kernel generator (`src/gpu/kernel_source.rs`)
+/// bakes it into device code as `MIX_INV`, alongside `MIX_MULTIPLIER`, to implement this
+/// same file's `feasible_mbr_val` check on-device.
+pub(crate) const MIX_MULTIPLIER_INV: u64 = mod_inverse_pow2_64(MIX_MULTIPLIER);
 
 /// Check whether a `required_mix` (from `required_mix()`) corresponds to an achievable
 /// `mbr_val` (0..=2047), i.e. some real MBR identity could produce it. Returns the

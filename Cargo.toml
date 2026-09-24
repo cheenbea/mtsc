@@ -11,10 +11,30 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+# GPU (CUDA) collision-search backend -- see src/gpu/cuda.rs. Not gated behind any
+# Cargo feature: compiles in unconditionally, on every platform cudarc supports
+# (Linux/Windows; macOS never has an NVIDIA GPU/driver, so src/gpu/mod.rs gates the
+# `cuda` submodule itself on `not(target_os = "macos")`, not this dependency).
+# `cuda-version-from-build-system` + `fallback-latest`: cudarc's own build.rs panics
+# unless a specific CUDA toolkit version feature (or the `CUDARC_CUDA_VERSION` env
+# var) is set; these two make it probe a local `nvcc` and fall back to the latest
+# known version header set when none is found, so building never requires an
+# installed CUDA toolkit. Default features already include `fallback-dynamic-loading`
+# (dlopen the driver/NVRTC libraries at runtime; never link against them at build
+# time), which is what lets this compile on a machine with no GPU at all.
+cudarc = { version = "0.19", features = ["cuda-version-from-build-system", "fallback-latest"] }
 curve25519-dalek = "4"
 data-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+# GPU (Metal) collision-search backend -- see src/gpu/metal.rs. Always present on
+# macOS (the Metal toolchain ships with every macOS SDK); not gated behind any
+# Cargo feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-metal = "0.3"
 
 [profile.release]
 opt-level = 3

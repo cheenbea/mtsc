@@ -171,6 +171,17 @@ impl HashEngine {
         self.backend
     }
 
+    /// Measure this engine's throughput (hashes/second) with `threads` workers over a
+    /// short sampling window, reusing the exact same multi-threaded calibration
+    /// routine `auto_for_threads` already runs at startup (`sample_rate` below) --
+    /// no separate benchmark loop. Intended for one-off comparisons (e.g. CPU vs GPU
+    /// device rate) after `self` was already validated by `auto`/`auto_for_threads`;
+    /// errors only if the sampling workers themselves fail to spawn or panic, never
+    /// because of a CPU-support problem (that was already ruled out to obtain `self`).
+    pub fn sample_rate_hz(self, threads: usize, duration: Duration) -> Result<f64, &'static str> {
+        sample_rate(self, threads, duration)
+    }
+
     /// Return the number of independent messages computed by one kernel call.
     pub fn batch_size(self) -> usize {
         self.batch_size

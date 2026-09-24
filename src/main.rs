@@ -5,12 +5,13 @@
 
 mod convert;
 mod curve25519;
+mod gpu;
 mod mbr_table;
 // The binary's license verifier uses K; the shared library additionally uses the IV.
 #[allow(dead_code)]
 mod sha256_constants;
 use mtsc::sha256;
-use mtsc::sha256_backend::{HashBatch, HashEngine};
+use mtsc::sha256_backend::{precompute_constant_words, HashBatch, HashEngine};
 mod software_id;
 mod targets;
 
@@ -20,7 +21,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ---- Constants ----
 
@@ -34,6 +35,9 @@ const MODEL_LEN: usize = 16;
 const INPUT_LEN: usize = SERIAL_LEN + MODEL_LEN + 4;
 /// Progress report interval (every 10,000M = 10 billion hashes)
 const PROGRESS_INTERVAL: u64 = 10_000_000_000;
+/// Candidates per GPU kernel launch. Large enough to amortize launch/sync overhead,
+/// small enough that the stop flag and progress reporting stay responsive.
+const GPU_CHUNK: u64 = 1 << 20;
 
 // ---- CLI definition ----
 
@@ -794,14 +798,38 @@ fn cmd_search(
         })
     };
 
-    let handles: Vec<_> = (0..num_threads)
-        .map(|tid| {
-            let ctx = Arc::clone(&ctx);
-            thread::spawn(move || {
-                search_batch(tid, num_threads, start_serial, &ctx, engine);
+    // Automatic GPU/CPU selection: try to compile and self-check GPU device(s), then race
+    // a short measured rate against the CPU engine. Every failure mode here (no backend
+    // compiled in for this platform, no device present, self-check disagreement, a device
+    // erroring during the benchmark) falls back to the CPU path silently (an informational
+    // note only) -- there is no way to force GPU-only or CPU-only, and GPU problems must
+    // never abort the search or exit the process.
+    let gpu_devices = select_gpu_devices(&ctx, engine, num_threads, start_serial);
+
+    let handles: Vec<_> = if gpu_devices.is_empty() {
+        (0..num_threads)
+            .map(|tid| {
+                let ctx = Arc::clone(&ctx);
+                thread::spawn(move || {
+                    search_batch(tid, num_threads, start_serial, &ctx, engine);
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        let targets_list = Arc::new(gpu_target_list(&ctx));
+        let num_devices = gpu_devices.len();
+        gpu_devices
+            .into_iter()
+            .enumerate()
+            .map(|(did, dev)| {
+                let ctx = Arc::clone(&ctx);
+                let targets_list = Arc::clone(&targets_list);
+                thread::spawn(move || {
+                    search_gpu_device(dev, did, num_devices, start_serial, &ctx, &targets_list);
+                })
+            })
+            .collect()
+    };
 
     let mut worker_failed = false;
     for h in handles {
@@ -1211,6 +1239,310 @@ fn report_progress(hashes: u64, start: &Instant, found_count: &AtomicUsize) {
     let elapsed = start.elapsed().as_secs();
     let fc = found_count.load(Ordering::Relaxed);
     eprintln!("{}M hashes, {}s, {} found", hashes / 1_000_000, elapsed, fc);
+}
+
+// ---- GPU device selection and driving ----
+
+/// The comparison target list a compiled GPU kernel checks each candidate against:
+/// fixed mode `(need_lo, need_hi)` pairs (mirrors `check_match`), sweep mode raw
+/// `(tv_lo, tv_hi)` pairs (mirrors `sweep_check_match`) -- see `gpu::GpuRun::targets`.
+fn gpu_target_list(ctx: &SearchContext) -> Vec<(u32, u32)> {
+    match ctx.raw_targets.as_ref() {
+        Some(raw) => raw
+            .tv_lo
+            .iter()
+            .zip(raw.tv_hi.iter())
+            .map(|(&lo, &hi)| (lo, hi))
+            .collect(),
+        None => ctx.targets.iter().map(|t| (t.need_lo, t.need_hi)).collect(),
+    }
+}
+
+/// Build the per-run kernel spec for `ctx`'s exact serial construction and match mode.
+/// `capacity` is the real target count (at least 1 -- `gpu::kernel_source` requires it).
+fn build_gpu_kernel_spec(ctx: &SearchContext, num_targets: usize) -> gpu::GpuKernelSpec {
+    gpu::GpuKernelSpec {
+        alphabet: SEARCH_ALPHABET.to_vec(),
+        pad_end: matches!(ctx.pad, PadPosition::End),
+        sweep: ctx.raw_targets.is_some(),
+        w5_9: precompute_constant_words(&ctx.model_bytes, &ctx.sv_bytes),
+        capacity: num_targets.max(1),
+    }
+}
+
+/// Build a self-check that is independent of the user's real targets: hash one known
+/// candidate index (`probe_index`) on the CPU scalar reference, then construct a single
+/// synthetic target that a correct kernel must unconditionally match at that index --
+/// `(sid_lo, sid_hi|0x100)` is a direct hit in fixed mode, and collapses `required_mix`'s
+/// XOR to zero (mbr_val 0, always feasible) in sweep mode, so the exact same target pair
+/// works for either mode. A positive-control run containing `probe_index` must reproduce
+/// exactly this one hit; a disjoint negative-control run must reproduce none -- agreement
+/// on both exercises the whole on-device pipeline (serial generation, padding, hashing,
+/// match logic) against the scalar reference, per `gpu::GpuSelfCheck`'s contract.
+fn build_gpu_self_check(ctx: &SearchContext, start_serial: u64) -> gpu::GpuSelfCheck {
+    let probe_index = start_serial.wrapping_add(4096);
+    let mut serial = [SEARCH_ALPHABET[0]; SERIAL_LEN];
+    ctx.write_candidate(&mut serial, probe_index);
+    let serial = ctx.pad_candidate(&serial);
+    let (sid_lo, sid_hi) =
+        sha256::hash_40(&build_input_buf(&serial, &ctx.model_bytes, &ctx.sv_bytes));
+    let need_hi = (sid_hi as u32) | 0x100;
+    gpu::GpuSelfCheck {
+        runs: vec![
+            (probe_index.wrapping_sub(2048), 4096), // positive control: contains probe_index
+            (start_serial, 1024),                   // negative control: disjoint from it
+        ],
+        targets: vec![(sid_lo, need_hi)],
+        expect: vec![gpu::GpuHit {
+            index: probe_index,
+            sid_lo,
+            sid_hi,
+            target_idx: 0,
+        }],
+    }
+}
+
+/// Attempt automatic GPU selection: compile devices, self-check each against the CPU
+/// scalar reference, and keep only the ones that agree. Every failure mode (no backend
+/// compiled in for this platform, no device present, a self-check disagreement) is
+/// reported with an informational `eprintln!` and an empty `Vec` -- the caller then runs
+/// the existing CPU path. Never exits the process and never panics on a GPU problem.
+fn usable_gpu_devices(
+    ctx: &SearchContext,
+    num_targets: usize,
+    start_serial: u64,
+) -> Vec<Box<dyn gpu::GpuDevice>> {
+    let spec = build_gpu_kernel_spec(ctx, num_targets);
+    let mut devices = gpu::compile_devices(&spec);
+    if devices.is_empty() {
+        return Vec::new();
+    }
+    let check = build_gpu_self_check(ctx, start_serial);
+    let mut good = Vec::new();
+    for mut dev in devices.drain(..) {
+        let name = dev.name();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu::self_check(dev.as_mut(), &check)
+        })) {
+            Ok(Ok(())) => good.push(dev),
+            Ok(Err(error)) => {
+                eprintln!("Info: GPU device {name} failed self-check, skipping: {error}")
+            }
+            Err(_) => eprintln!("Info: GPU device {name} self-check panicked, skipping"),
+        }
+    }
+    good
+}
+
+/// Automatic GPU/CPU selection for the search that's about to run. Returns the GPU
+/// devices to drive the search on, or an empty `Vec` to use the existing CPU path.
+/// GPU problems at any stage (compile, self-check, benchmark) are reported with an
+/// informational note and silently fall back to CPU -- never a hard error.
+fn select_gpu_devices(
+    ctx: &SearchContext,
+    engine: HashEngine,
+    num_threads: usize,
+    start_serial: u64,
+) -> Vec<Box<dyn gpu::GpuDevice>> {
+    let targets_list = gpu_target_list(ctx);
+    let mut good = usable_gpu_devices(ctx, targets_list.len(), start_serial);
+    if good.is_empty() {
+        eprintln!("Info: no usable GPU device found; using CPU");
+        return Vec::new();
+    }
+
+    let bench_run = gpu::GpuRun {
+        base: start_serial,
+        n: GPU_CHUNK,
+        targets: targets_list,
+    };
+    let mut best_rate = 0.0_f64;
+    let mut names = Vec::with_capacity(good.len());
+    for dev in good.iter_mut() {
+        names.push(dev.name());
+        let (rate, hits) = gpu::sample_rate(dev.as_mut(), &bench_run);
+        // A real collision found during benchmarking must never be silently dropped.
+        for hit in &hits {
+            report_gpu_hit(hit, ctx);
+        }
+        if rate > best_rate {
+            best_rate = rate;
+        }
+    }
+
+    let cpu_rate = engine
+        .sample_rate_hz(num_threads, Duration::from_millis(100))
+        .unwrap_or(0.0);
+    if best_rate > cpu_rate {
+        println!(
+            "GPU: using {} device(s) [{}] (~{:.1}M hash/s vs CPU ~{:.1}M hash/s)",
+            good.len(),
+            names.join(", "),
+            best_rate / 1e6,
+            cpu_rate / 1e6
+        );
+        good
+    } else {
+        eprintln!(
+            "Info: GPU device(s) [{}] benchmarked slower than CPU (~{:.1}M vs ~{:.1}M hash/s); using CPU",
+            names.join(", "),
+            best_rate / 1e6,
+            cpu_rate / 1e6
+        );
+        Vec::new()
+    }
+}
+
+/// Report and verify one GPU-reported hit exactly as `check_match`/`sweep_check_match`
+/// do for the CPU path: independently rehash on the CPU scalar reference before ever
+/// printing or counting it (a GPU-reported digest is advisory only, per `gpu::GpuHit`'s
+/// doc comment). Fixed mode maps `target_idx` straight into `ctx.targets`; sweep mode
+/// recomputes `required_mix`/`feasible_mbr_val` from the target's raw `(tv_lo, tv_hi)`
+/// to recover `mbr_val`, mirroring `sweep_check_match`'s cold reporting path exactly.
+fn report_gpu_hit(hit: &gpu::GpuHit, ctx: &SearchContext) {
+    if let Some(raw_targets) = ctx.raw_targets.as_ref() {
+        let idx = hit.target_idx as usize;
+        let (Some(&tv_lo), Some(&tv_hi)) = (raw_targets.tv_lo.get(idx), raw_targets.tv_hi.get(idx))
+        else {
+            eprintln!(
+                "FATAL: GPU-reported target_idx {idx} is out of range for the loaded targets"
+            );
+            std::process::exit(1);
+        };
+        let required = targets::required_mix(hit.sid_lo, hit.sid_hi, tv_lo, tv_hi);
+        let Some(mbr_val) = targets::feasible_mbr_val(required) else {
+            eprintln!(
+                "FATAL: GPU-reported sweep hit failed the CPU required_mix/feasible_mbr_val re-check"
+            );
+            std::process::exit(1);
+        };
+        let mbr_table = ctx
+            .mbr_table
+            .as_ref()
+            .expect("sweep mode always carries an mbr_table");
+        let name = raw_targets.name(idx);
+        let (identity_hex, marker_hex) = mbr_table.lookup(mbr_val);
+        let mix = targets::mix_from_identity(&parse_identity_hex(identity_hex));
+        let (sbuf, sid) = verify_search_hit(hit.index, (hit.sid_lo, hit.sid_hi), mix, name, ctx)
+            .unwrap_or_else(|error| {
+                eprintln!("FATAL: {error}");
+                std::process::exit(1);
+            });
+        let n = ctx.found_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let serial_str = std::str::from_utf8(&sbuf).unwrap();
+        println!(
+            "FOUND [{}] serial={} target={} mbr_val={} identity={} marker={} verified={} (gpu)",
+            n, serial_str, name, mbr_val, identity_hex, marker_hex, sid
+        );
+        if ctx.max_collisions > 0 && n >= ctx.max_collisions {
+            ctx.stop.store(true, Ordering::Relaxed);
+        }
+    } else {
+        let idx = hit.target_idx as usize;
+        let Some(t) = ctx.targets.get(idx) else {
+            eprintln!(
+                "FATAL: GPU-reported target_idx {idx} is out of range for the loaded targets"
+            );
+            std::process::exit(1);
+        };
+        let (sbuf, sid) = verify_search_hit(
+            hit.index,
+            (hit.sid_lo, hit.sid_hi),
+            (ctx.mix_lo, ctx.mix_hi),
+            &t.name,
+            ctx,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("FATAL: {error}");
+            std::process::exit(1);
+        });
+        let n = ctx.found_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let serial_str = std::str::from_utf8(&sbuf).unwrap();
+        println!(
+            "FOUND [{}] serial={} target={} verified={} (gpu)",
+            n, serial_str, t.name, sid
+        );
+        if ctx.max_collisions > 0 && n >= ctx.max_collisions {
+            ctx.stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Drive one GPU device over its share of the candidate space (device `did` of
+/// `num_devices`, interleaved by `GPU_CHUNK`-sized launches -- the same partition
+/// pattern `search_batch` uses for CPU threads, just at launch granularity instead of
+/// per-candidate). Any device error aborts only this device's share and stops the whole
+/// search cleanly (matches `ctx.stop`'s existing contract) rather than panicking or
+/// exiting the process -- a mid-run GPU fault is not a reason to lose already-found hits
+/// or crash a search other devices/threads are still contributing to.
+fn search_gpu_device(
+    mut dev: Box<dyn gpu::GpuDevice>,
+    did: usize,
+    num_devices: usize,
+    start_serial: u64,
+    ctx: &SearchContext,
+    targets_list: &[(u32, u32)],
+) {
+    let limit = candidate_space_limit(SEARCH_ALPHABET.len());
+    let step = GPU_CHUNK.saturating_mul(num_devices as u64);
+    let offset = GPU_CHUNK.saturating_mul(did as u64);
+    let mut base = match limit {
+        Some(limit) => match start_serial.checked_add(offset) {
+            Some(base) if base < limit => base,
+            _ => return,
+        },
+        None => start_serial.wrapping_add(offset),
+    };
+    let mut run = gpu::GpuRun {
+        base,
+        n: 0,
+        targets: targets_list.to_vec(),
+    };
+
+    loop {
+        if ctx.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let n = match limit {
+            Some(limit) => GPU_CHUNK.min(limit - base),
+            None => GPU_CHUNK,
+        };
+        if n == 0 {
+            return;
+        }
+        run.base = base;
+        run.n = n;
+        match dev.run(&run) {
+            Ok(hits) => {
+                for hit in &hits {
+                    report_gpu_hit(hit, ctx);
+                    if ctx.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "Warning: GPU device {} errored during search, stopping: {error}",
+                    dev.name()
+                );
+                ctx.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        let previous_base = base;
+        match limit {
+            Some(limit) => match base.checked_add(step) {
+                Some(next) if next < limit => base = next,
+                _ => return,
+            },
+            None => base = base.wrapping_add(step),
+        }
+        if did == 0 && (base / PROGRESS_INTERVAL) != (previous_base / PROGRESS_INTERVAL) {
+            report_progress(base, &ctx.start, &ctx.found_count);
+        }
+    }
 }
 
 // ---- Other commands ----
